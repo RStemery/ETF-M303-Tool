@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sector ETF Momentum & Risk Ranking Tool (Prototype)</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #fff; color: #111; }
+  h1 { font-size: 20px; margin: 0 0 14px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .wrap { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .box { border: 2px solid #333; padding: 14px; background: #fff; }
+  .left { width: 290px; }
+  .right { flex: 1; min-width: 340px; }
+  label { display: block; font-weight: bold; margin: 12px 0 4px; font-size: 14px; }
+  input[type=number], input[type=text], select { width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #333; }
+  input[type=range] { width: 100%; }
+  button { margin-top: 14px; padding: 10px; width: 100%; font-weight: bold; border: 2px solid #333; background: #eee; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .kpis { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .kpi { border: 1px solid #333; padding: 8px 12px; min-width: 120px; }
+  .kpi small { display: block; color: #555; }
+  .kpi b { font-size: 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { border: 1px solid #999; padding: 6px; text-align: left; }
+  #status { font-size: 13px; color: #444; margin-top: 10px; white-space: pre-line; }
+  #err { color: #b00020; font-size: 13px; margin-top: 8px; white-space: pre-line; }
+  .trans { background: #f4f4f4; border: 2px solid #333; padding: 10px 14px; margin-top: 16px; font-size: 13px; }
+  .trans ul { margin: 6px 0 0; padding-left: 18px; }
+  .note { font-size: 12px; color: #555; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>Sector ETF Momentum &amp; Risk Ranking Tool (Prototype)</h1>
+<div class="wrap">
+
+  <div class="box left">
+    <h2>Inputs</h2>
+    <label for="lookback">Lookback window</label>
+    <select id="lookback">
+      <option value="30">30 trading days</option>
+      <option value="60" selected>60 trading days</option>
+      <option value="90">90 trading days</option>
+    </select>
+
+    <label for="minvol">Min avg daily volume (shares)</label>
+    <input type="number" id="minvol" value="1000000" min="0" step="100000">
+
+    <label for="risk">Risk tolerance: <span id="riskVal">5</span> / 10</label>
+    <input type="range" id="risk" min="0" max="10" value="5">
+    <div class="note">0 = cautious (favors risk-adjusted return), 10 = aggressive (favors raw momentum)</div>
+
+    <label for="key">Alpha Vantage API key</label>
+    <input type="text" id="key" value="MLD3LKZOIBY53H7O">
+
+    <label><input type="checkbox" id="quick" checked> Quick mode (first 5 ETFs only)</label>
+
+    <button id="run">Run / Get Recommendations</button>
+    <div id="status"></div>
+    <div id="err"></div>
+    <div class="note">Free key: 5 calls/min, 25/day. Results are cached in this browser for 12 hours.</div>
+  </div>
+
+  <div class="right">
+    <div class="box">
+      <h2>Dashboard KPIs</h2>
+      <div class="kpis">
+        <div class="kpi"><small>ETFs passing filter</small><b id="k1">--</b></div>
+        <div class="kpi"><small>Top pick momentum</small><b id="k2">--</b></div>
+        <div class="kpi"><small>Data as of</small><b id="k3">--</b></div>
+      </div>
+
+      <h2>Recommendation Output (Ranked List)</h2>
+      <table>
+        <thead><tr><th>Rank</th><th>ETF</th><th>Score</th><th>Momentum %</th><th>Risk-Adj</th><th>Avg Volume</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="6">Run the tool to see results.</td></tr></tbody>
+      </table>
+      <p id="why"></p>
+
+      <div class="trans">
+        <b>Model Transparency</b>
+        <ul>
+          <li>Assumes the past 30-90 trading days of price movement is a useful signal, and scores each ETF only relative to the other ETFs in the same run.</li>
+          <li>Uses unadjusted closing prices from Alpha Vantage's free tier, so dividends are left out. Data may be stale, so the "data as of" date is always shown.</li>
+          <li>A high rank means strong recent performance under your settings. It does not mean the ETF will keep rising or is the best investment for you.</li>
+          <li>Not financial advice. The model ignores fees, valuation, taxes, and what you already own.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const ALL = ["XLK","XLF","XLV","XLE","XLY","XLP","XLI","XLB","XLU","XLRE","XLC"];
+const TTL = 12 * 60 * 60 * 1000;
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+$("risk").addEventListener("input", () => $("riskVal").textContent = $("risk").value);
+
+function cacheGet(t) {
+  try {
+    const raw = localStorage.getItem("av_" + t);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return (Date.now() - o.ts < TTL) ? o : null;
+  } catch (e) { return null; }
+}
+function cacheSet(t, rows, asOf) {
+  try { localStorage.setItem("av_" + t, JSON.stringify({ ts: Date.now(), rows, asOf })); } catch (e) {}
+}
+
+// API call + type conversion + sort oldest to newest
+async function fetchETF(t, key) {
+  const url = "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=" + t + "&outputsize=compact&apikey=" + encodeURIComponent(key);
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data["Note"] || data["Information"] || data["Error Message"] || !data["Time Series (Daily)"]) {
+    throw new Error(data["Note"] || data["Information"] || data["Error Message"] || "No data returned");
+  }
+  const ts = data["Time Series (Daily)"];
+  const rows = Object.keys(ts).sort().map(d => ({ d, close: parseFloat(ts[d]["4. close"]), vol: parseFloat(ts[d]["5. volume"]) }));
+  const asOf = data["Meta Data"]["3. Last Refreshed"];
+  cacheSet(t, rows, asOf);
+  return { rows, asOf };
+}
+
+const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+const stdev = a => { const m = mean(a); return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1)); };
+const scale = (v, lo, hi) => hi === lo ? 50 : (v - lo) / (hi - lo) * 100;
+
+function metrics(t, rows, n) {
+  const w = rows.slice(-n);
+  const closes = w.map(r => r.close);
+  const rets = [];
+  for (let i = 1; i < closes.length; i++) rets.push(closes[i] / closes[i - 1] - 1);
+  const sd = stdev(rets);
+  return {
+    t,
+    mom: (closes[closes.length - 1] - closes[0]) / closes[0] * 100,
+    ra: sd === 0 ? 0 : mean(rets) / sd,
+    vol: mean(w.map(r => r.vol))
+  };
+}
+
+async function run() {
+  const n = parseInt($("lookback").value, 10);
+  const minVol = parseFloat($("minvol").value) || 0;
+  const wMom = parseInt($("risk").value, 10) / 10;
+  const key = $("key").value.trim();
+  const list = $("quick").checked ? ALL.slice(0, 5) : ALL;
+  $("err").textContent = "";
+  $("run").disabled = true;
+
+  const results = [];
+  let asOfAll = "";
+  const skipped = [];
+
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i];
+    let d = cacheGet(t);
+    if (d) {
+      $("status").textContent = "Loaded " + t + " from cache (" + (i + 1) + "/" + list.length + ")";
+    } else {
+      $("status").textContent = "Calling Alpha Vantage for " + t + " (" + (i + 1) + "/" + list.length + ")...";
+      try {
+        d = await fetchETF(t, key);
+        if (i < list.length - 1) {
+          $("status").textContent += "\nWaiting ~13s to stay under the 5 calls/min limit...";
+          await sleep(13000);
+        }
+      } catch (e) {
+        $("err").textContent = "Stopped at " + t + ": " + e.message + "\nShowing results for the ETFs loaded so far.";
+        skipped.push(t);
+        break;
+      }
+    }
+    if (d.rows.length >= n) {
+      results.push(metrics(t, d.rows, n));
+      if (d.asOf > asOfAll) asOfAll = d.asOf;
+    }
+  }
+
+  $("status").textContent = "Done. Loaded " + results.length + " of " + list.length + " ETFs.";
+  $("run").disabled = false;
+
+  const ok = results.filter(r => r.vol >= minVol);
+  $("k1").textContent = ok.length + " of " + list.length;
+  $("k3").textContent = asOfAll || "--";
+  if (ok.length === 0) {
+    $("rows").innerHTML = '<tr><td colspan="6">No ETFs passed the volume filter. Lower the minimum volume.</td></tr>';
+    $("k2").textContent = "--"; $("why").textContent = "";
+    return;
+  }
+
+  const mLo = Math.min(...ok.map(r => r.mom)), mHi = Math.max(...ok.map(r => r.mom));
+  const rLo = Math.min(...ok.map(r => r.ra)), rHi = Math.max(...ok.map(r => r.ra));
+  ok.forEach(r => { r.score = wMom * scale(r.mom, mLo, mHi) + (1 - wMom) * scale(r.ra, rLo, rHi); });
+  ok.sort((a, b) => b.score - a.score || b.vol - a.vol);
+
+  const top5 = ok.slice(0, 5);
+  $("rows").innerHTML = top5.map((r, i) =>
+    "<tr><td>" + (i + 1) + "</td><td>" + r.t + "</td><td>" + r.score.toFixed(1) + "</td><td>" +
+    r.mom.toFixed(2) + "</td><td>" + r.ra.toFixed(3) + "</td><td>" + Math.round(r.vol).toLocaleString() + "</td></tr>"
+  ).join("");
+  const top = top5[0];
+  $("k2").textContent = (top.mom >= 0 ? "+" : "") + top.mom.toFixed(2) + "%";
+  $("why").textContent = top.t + " ranks first because its " + n + "-day momentum of " + top.mom.toFixed(2) +
+    "% and risk-adjusted return of " + top.ra.toFixed(3) + " score highest at your " + Math.round(wMom * 100) +
+    "/" + Math.round((1 - wMom) * 100) + " momentum/risk-adjusted weighting.";
+}
+$("run").addEventListener("click", run);
+</script>
+</body>
+</html>
